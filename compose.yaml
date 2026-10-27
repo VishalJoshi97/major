@@ -8,6 +8,8 @@ services:
       DATA_DIR: /data
       CORS_ORIGINS: http://localhost:5173,http://localhost:4173
       PROMETHEUS_URL: http://prometheus:9090
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_EXTERNAL_URL: http://localhost:3000
     ports:
       - "8080:8080"
     volumes:
@@ -63,6 +65,25 @@ services:
       - /dev/kmsg
     restart: unless-stopped
 
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: aegis-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=aegis123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=localhost
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   autoscaling_data:
   prometheus_data:
+  grafana_data:
