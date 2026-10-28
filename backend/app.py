@@ -1,17 +1,19 @@
 from __future__ import annotations
 import asyncio, json, os, re, shutil, sqlite3, subprocess, time, uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
 import psutil
 import docker
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Header, Query
 from prometheus_fastapi_instrumentator import Instrumentator
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from jose import jwt as jose_jwt, JWTError
+from passlib.context import CryptContext
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -19,12 +21,22 @@ DB_PATH = DATA_DIR / "autoscaling.db"
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "").rstrip("/")
 STRATEGIES = ("CPU", "TREND", "LATENCY")
 
+JWT_SECRET = os.getenv("JWT_SECRET", "aegiscloud-dev-secret-change-in-prod")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 import math as _math, threading as _threading
 from collections import deque as _deque
 
 # Rolling metric history (updated by prometheus_scrape_loop, consumed by advisor)
 _metric_history: _deque = _deque(maxlen=15)  # ~75 s at 5 s interval
 _history_lock = _threading.Lock()
+
+# Advisor recommendation tracker for live scaling event emission
+_last_advisor_recs: dict = {}  # strategy -> last recommended replicas
+_advisor_lock = _threading.Lock()
 
 
 # ── Workload replica detection: K8s → kubectl → Docker workload filter → 1 ──
@@ -115,6 +127,17 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT, timestamp TEXT NOT NULL,
           strategy TEXT NOT NULL, previous_replicas INTEGER NOT NULL, desired_replicas INTEGER NOT NULL,
           reason TEXT NOT NULL, source TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL UNIQUE,
+          display_name TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          accepted_tos INTEGER NOT NULL DEFAULT 0,
+          accepted_tos_at TEXT,
+          created_at TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'user'
         );
         """)
 
@@ -229,6 +252,43 @@ class MetricIngest(BaseModel):
     note: Optional[str] = None
 
 
+class UserRegister(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    email: str = Field(min_length=5, max_length=150)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str = Field(min_length=2, max_length=100)
+    accepted_tos: bool
+
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+def _create_jwt(user_id: str, username: str, role: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    payload = {"sub": user_id, "username": username, "role": role, "exp": expire}
+    return jose_jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    with db() as c:
+        user = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return rowdict(user)
+
+
 def rowdict(row):
     return dict(row) if row is not None else None
 
@@ -245,6 +305,53 @@ def split_image(image_ref: str):
 @app.get("/healthz")
 def health():
     return {"status": "ok", "service": "autoscaling-evaluation-api", "timestamp": now_iso()}
+
+
+# ── Auth routes ───────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/auth/register", status_code=201)
+def auth_register(payload: UserRegister):
+    if not payload.accepted_tos:
+        raise HTTPException(status_code=400, detail="You must accept the terms of service.")
+    # bcrypt limit: truncate to 72 bytes before hashing
+    password_hash = pwd_context.hash(payload.password[:72])
+    user_id = str(uuid.uuid4())
+    now = now_iso()
+    with db() as c:
+        if c.execute("SELECT 1 FROM users WHERE username=?", (payload.username,)).fetchone():
+            raise HTTPException(status_code=409, detail="Username already taken")
+        if c.execute("SELECT 1 FROM users WHERE email=?", (payload.email,)).fetchone():
+            raise HTTPException(status_code=409, detail="Email already registered")
+        c.execute(
+            "INSERT INTO users(id,username,email,display_name,password_hash,accepted_tos,accepted_tos_at,created_at,role) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (user_id, payload.username, payload.email, payload.display_name,
+             password_hash, 1, now, now, "user"),
+        )
+    token = _create_jwt(user_id, payload.username, "user")
+    return {"access_token": token, "token_type": "bearer",
+            "user": {"id": user_id, "username": payload.username,
+                     "email": payload.email, "display_name": payload.display_name,
+                     "role": "user", "created_at": now}}
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(payload: UserLogin):
+    with db() as c:
+        user = c.execute("SELECT * FROM users WHERE username=?", (payload.username,)).fetchone()
+    if not user or not pwd_context.verify(payload.password[:72], user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    u = rowdict(user)
+    token = _create_jwt(u["id"], u["username"], u["role"])
+    u.pop("password_hash", None)
+    return {"access_token": token, "token_type": "bearer", "user": u}
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(authorization: str = Header(None)):
+    user = get_current_user(authorization)
+    user.pop("password_hash", None)
+    return user
 
 @app.get("/api/v1/overview")
 def overview():
@@ -712,10 +819,28 @@ def infrastructure_recommendations():
             "current": replicas,
         }
 
+    # Emit scaling events when recommendations change
+    new_events = 0
+    with _advisor_lock:
+        for strategy, rec in recs.items():
+            desired = rec["recommended_replicas"]
+            last_desired = _last_advisor_recs.get(strategy)
+            if last_desired is not None and desired != last_desired:
+                with db() as c:
+                    c.execute(
+                        "INSERT INTO scaling_events(experiment_id,timestamp,strategy,"
+                        "previous_replicas,desired_replicas,reason,source) VALUES(?,?,?,?,?,?,?)",
+                        (None, now_iso(), strategy, last_desired, desired,
+                         rec["reason"], "PROMETHEUS_ADVISOR"),
+                    )
+                new_events += 1
+            _last_advisor_recs[strategy] = desired
+
     return {
         "timestamp": now_iso(),
         "replica_source": replica_source,
         "history_points": len(rate_history),
+        "new_scaling_events": new_events,
         "current_metrics": {
             "cpu_percent":  round(cpu,     2),
             "latency_ms":   round(latency, 2),
